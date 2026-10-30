@@ -1,21 +1,37 @@
 /*
 Azure SQL Managed Instance - Per-File I/O Performance Sampler
 
-Measures SQL Server observed I/O activity for each database file.
+Purpose
+-------
+Samples sys.dm_io_virtual_file_stats() and reports per database file:
 
-Output:
-- File size
-- Sample count
-- AVG / P50 / P75 / P95 / MAX IOPS
-- AVG / P50 / P75 / P95 / MAX throughput (MB/s)
+1. Total data transferred during the collection window
+   - TotalReadGiB
+   - TotalWriteGiB
+   - TotalIOGiB
 
-IOPS:
-    Reads + Writes per second
+2. IOPS statistics
+   - Average
+   - P50
+   - P75
+   - P95
+   - Maximum
 
-Throughput:
-    Bytes Read + Bytes Written per second
+3. Throughput statistics
+   - Average MB/s
+   - P50 MB/s
+   - P75 MB/s
+   - P95 MB/s
+   - Maximum MB/s
 
-No Azure storage tier/limit comparison is performed.
+Notes
+-----
+- IOPS = reads + writes per second.
+- Throughput = bytes read + bytes written per second.
+- GiB uses 1024^3 bytes.
+- Performance statistics represent activity observed only during
+  this script's collection window.
+- No Azure storage tier/limit comparison is performed.
 */
 
 SET NOCOUNT ON;
@@ -25,8 +41,8 @@ BEGIN TRY
     ------------------------------------------------------------
     -- Parameters
     ------------------------------------------------------------
-    -- Change sampling loop duration to collect data over a representative time interval
-    DECLARE @LoopDurationSeconds int = 60;
+	-- Change sampling loop duration to collect data over a representative time interval
+    DECLARE @LoopDurationSeconds int = 30;
     DECLARE @IntervalLengthMilliseconds int = 1000;
 
     IF @IntervalLengthMilliseconds < 100
@@ -34,10 +50,11 @@ BEGIN TRY
               'The minimum supported sampling interval duration is 100 ms.',
               1;
 
+
     ------------------------------------------------------------
     -- Initialize
     ------------------------------------------------------------
-    DECLARE @StartDateTime datetime2(2) = SYSDATETIME();
+    DECLARE @StartDateTime datetime2(3) = SYSDATETIME();
 
     DECLARE @DelayInterval varchar(12) =
         CONVERT
@@ -52,16 +69,20 @@ BEGIN TRY
             114
         );
 
+
     ------------------------------------------------------------
     -- Sampling table
     ------------------------------------------------------------
     DECLARE @VFSSample TABLE
     (
-        SampleMs       bigint   NOT NULL,
-        DatabaseID     smallint NOT NULL,
-        FileID         smallint NOT NULL,
-        TransferCount  bigint   NOT NULL,
-        ByteCount      bigint   NOT NULL,
+        SampleMs        bigint   NOT NULL,
+        DatabaseID      smallint NOT NULL,
+        FileID          smallint NOT NULL,
+
+        TransferCount   bigint   NOT NULL,
+
+        ReadByteCount   bigint   NOT NULL,
+        WriteByteCount  bigint   NOT NULL,
 
         PRIMARY KEY
         (
@@ -70,6 +91,7 @@ BEGIN TRY
             FileID
         )
     );
+
 
     ------------------------------------------------------------
     -- Collect samples
@@ -84,22 +106,28 @@ BEGIN TRY
             DatabaseID,
             FileID,
             TransferCount,
-            ByteCount
+            ReadByteCount,
+            WriteByteCount
         )
         SELECT
             vfs.sample_ms,
             vfs.database_id,
             vfs.file_id,
 
-            vfs.num_of_reads +
-            vfs.num_of_writes,
+            vfs.num_of_reads
+                + vfs.num_of_writes,
 
-            vfs.num_of_bytes_read +
+            vfs.num_of_bytes_read,
+
             vfs.num_of_bytes_written
 
-        FROM sys.dm_io_virtual_file_stats(DEFAULT, DEFAULT) AS vfs
+        FROM sys.dm_io_virtual_file_stats
+        (
+            DEFAULT,
+            DEFAULT
+        ) AS vfs
 
-        -- Exclude databases/files residing on local storage
+        -- Exclude databases/files on local storage
         WHERE vfs.database_id NOT IN
         (
             2,
@@ -116,7 +144,7 @@ BEGIN TRY
 
     ------------------------------------------------------------
     -- Step 1
-    -- Calculate change between consecutive samples
+    -- Calculate counter changes between consecutive samples
     ------------------------------------------------------------
     ;WITH SampleDelta AS
     (
@@ -125,39 +153,71 @@ BEGIN TRY
             s.FileID,
             s.SampleMs,
 
+            ----------------------------------------------------
+            -- Next sample time
+            ----------------------------------------------------
             LEAD(s.SampleMs)
                 OVER
                 (
                     PARTITION BY
                         s.DatabaseID,
                         s.FileID
+
                     ORDER BY
                         s.SampleMs
-                ) AS NextSampleMs,
+                )
+                AS NextSampleMs,
 
+
+            ----------------------------------------------------
+            -- I/O operation delta
+            ----------------------------------------------------
             LEAD(s.TransferCount)
                 OVER
                 (
                     PARTITION BY
                         s.DatabaseID,
                         s.FileID
+
                     ORDER BY
                         s.SampleMs
                 )
                 - s.TransferCount
                 AS TransferDelta,
 
-            LEAD(s.ByteCount)
+
+            ----------------------------------------------------
+            -- Read byte delta
+            ----------------------------------------------------
+            LEAD(s.ReadByteCount)
                 OVER
                 (
                     PARTITION BY
                         s.DatabaseID,
                         s.FileID
+
                     ORDER BY
                         s.SampleMs
                 )
-                - s.ByteCount
-                AS ByteDelta
+                - s.ReadByteCount
+                AS ReadByteDelta,
+
+
+            ----------------------------------------------------
+            -- Write byte delta
+            ----------------------------------------------------
+            LEAD(s.WriteByteCount)
+                OVER
+                (
+                    PARTITION BY
+                        s.DatabaseID,
+                        s.FileID
+
+                    ORDER BY
+                        s.SampleMs
+                )
+                - s.WriteByteCount
+                AS WriteByteDelta
 
         FROM @VFSSample AS s
     ),
@@ -165,7 +225,7 @@ BEGIN TRY
 
     ------------------------------------------------------------
     -- Step 2
-    -- Convert delta counters into IOPS and MB/s
+    -- Convert deltas into IOPS / MB/s
     ------------------------------------------------------------
     IntervalPerf AS
     (
@@ -174,32 +234,41 @@ BEGIN TRY
             sd.FileID,
             sd.SampleMs,
 
+            sd.ReadByteDelta,
+            sd.WriteByteDelta,
+
+
             ----------------------------------------------------
-            -- IOPS
+            -- Total IOPS = Read IOPS + Write IOPS
             ----------------------------------------------------
             CAST
             (
                 sd.TransferDelta
                 *
                 (
-                    1000.0 /
+                    1000.0
+                    /
                     NULLIF
                     (
                         sd.NextSampleMs - sd.SampleMs,
                         0
                     )
                 )
+
                 AS decimal(18,2)
             ) AS IOPS,
 
 
             ----------------------------------------------------
-            -- Throughput MB/s
+            -- Total throughput MB/s
             ----------------------------------------------------
             CAST
             (
                 (
-                    sd.ByteDelta
+                    (
+                        sd.ReadByteDelta
+                        + sd.WriteByteDelta
+                    )
                     /
                     (
                         NULLIF
@@ -219,20 +288,22 @@ BEGIN TRY
         FROM SampleDelta AS sd
 
         WHERE
+            -- Last sample does not have a next sample
             sd.NextSampleMs IS NOT NULL
 
-            -- Protect against counter reset / invalid sample
-            AND sd.TransferDelta >= 0
-            AND sd.ByteDelta >= 0
-
-            -- Protect against zero elapsed time
+            -- Protect against zero/invalid interval
             AND sd.NextSampleMs > sd.SampleMs
+
+            -- Protect against counter resets
+            AND sd.TransferDelta >= 0
+            AND sd.ReadByteDelta >= 0
+            AND sd.WriteByteDelta >= 0
     ),
 
 
     ------------------------------------------------------------
     -- Step 3
-    -- Add database/file information
+    -- Add database/file metadata
     ------------------------------------------------------------
     FilePerf AS
     (
@@ -254,19 +325,26 @@ BEGIN TRY
 
             CAST
             (
-                mf.size * 8.0 / 1024 / 1024
+                mf.size * 8.0
+                / 1024
+                / 1024
+
                 AS decimal(18,2)
             ) AS FileSizeGB,
 
             ip.SampleMs,
+
+            ip.ReadByteDelta,
+            ip.WriteByteDelta,
+
             ip.IOPS,
             ip.ThroughputMBPS
 
         FROM IntervalPerf AS ip
 
         INNER JOIN sys.master_files AS mf
-            ON ip.DatabaseID = mf.database_id
-           AND ip.FileID = mf.file_id
+            ON  ip.DatabaseID = mf.database_id
+            AND ip.FileID     = mf.file_id
     ),
 
 
@@ -281,7 +359,7 @@ BEGIN TRY
 
 
             ----------------------------------------------------
-            -- IOPS Percentiles
+            -- IOPS percentiles
             ----------------------------------------------------
             PERCENTILE_CONT(0.50)
                 WITHIN GROUP
@@ -326,7 +404,7 @@ BEGIN TRY
 
 
             ----------------------------------------------------
-            -- Throughput Percentiles
+            -- Throughput percentiles
             ----------------------------------------------------
             PERCENTILE_CONT(0.50)
                 WITHIN GROUP
@@ -383,7 +461,50 @@ BEGIN TRY
         FileType,
         FileSizeGB,
 
-        COUNT(*) AS SampleCount,
+
+        --------------------------------------------------------
+        -- Number of calculated intervals
+        --------------------------------------------------------
+        COUNT(*) AS IntervalCount,
+
+
+        --------------------------------------------------------
+        -- Total data transferred during collection window
+        --------------------------------------------------------
+        CAST
+        (
+            SUM(ReadByteDelta)
+            / 1024.0
+            / 1024.0
+            / 1024.0
+
+            AS decimal(18,3)
+        ) AS TotalReadGiB,
+
+
+        CAST
+        (
+            SUM(WriteByteDelta)
+            / 1024.0
+            / 1024.0
+            / 1024.0
+
+            AS decimal(18,3)
+        ) AS TotalWriteGiB,
+
+
+        CAST
+        (
+            (
+                SUM(ReadByteDelta)
+                + SUM(WriteByteDelta)
+            )
+            / 1024.0
+            / 1024.0
+            / 1024.0
+
+            AS decimal(18,3)
+        ) AS TotalIOGiB,
 
 
         --------------------------------------------------------
@@ -392,30 +513,39 @@ BEGIN TRY
         CAST
         (
             AVG(IOPS)
+
             AS decimal(18,2)
         ) AS AvgIOPS,
+
 
         CAST
         (
             MAX(P50_IOPS)
+
             AS decimal(18,2)
         ) AS P50_IOPS,
+
 
         CAST
         (
             MAX(P75_IOPS)
+
             AS decimal(18,2)
         ) AS P75_IOPS,
+
 
         CAST
         (
             MAX(P95_IOPS)
+
             AS decimal(18,2)
         ) AS P95_IOPS,
+
 
         CAST
         (
             MAX(IOPS)
+
             AS decimal(18,2)
         ) AS MaxIOPS,
 
@@ -426,30 +556,39 @@ BEGIN TRY
         CAST
         (
             AVG(ThroughputMBPS)
+
             AS decimal(18,2)
         ) AS AvgMBPS,
+
 
         CAST
         (
             MAX(P50_ThroughputMBPS)
+
             AS decimal(18,2)
         ) AS P50_MBPS,
+
 
         CAST
         (
             MAX(P75_ThroughputMBPS)
+
             AS decimal(18,2)
         ) AS P75_MBPS,
+
 
         CAST
         (
             MAX(P95_ThroughputMBPS)
+
             AS decimal(18,2)
         ) AS P95_MBPS,
+
 
         CAST
         (
             MAX(ThroughputMBPS)
+
             AS decimal(18,2)
         ) AS MaxMBPS
 
